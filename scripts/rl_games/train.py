@@ -9,6 +9,14 @@ import argparse
 import sys
 from distutils.util import strtobool
 
+from train_logging import (
+    cleanup_on_exit,
+    close_preserving_error,
+    close_training_writer,
+    upload_training_videos,
+    video_file_states,
+)
+
 from isaaclab.app import AppLauncher
 
 # add argparse arguments
@@ -184,95 +192,107 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
 
-    # create isaac environment
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    env = None
+    runner = None
+    wandb_run = None
+    video_folder = os.path.join(log_root_path, log_dir, "videos", "train") if args_cli.video else None
+    previous_videos = video_file_states(video_folder)
+    # Unwind in reverse order: finalize recordings and metrics, upload videos, finish W&B.
+    with (
+        cleanup_on_exit(
+            lambda: wandb_run.finish(exit_code=int(sys.exception() is not None)) if wandb_run is not None else None,
+            "W&B run",
+        ),
+        cleanup_on_exit(lambda: upload_training_videos(wandb_run, video_folder, previous_videos), "video upload"),
+        cleanup_on_exit(lambda: close_training_writer(runner), "TensorBoard writer"),
+        cleanup_on_exit(lambda: env.close() if env is not None else None, "training environment"),
+    ):
+        # create isaac environment
+        env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
-    # convert to single-agent instance if required by the RL algorithm
-    if isinstance(env.unwrapped, DirectMARLEnv):
-        env = multi_agent_to_single_agent(env)
+        # convert to single-agent instance if required by the RL algorithm
+        if isinstance(env.unwrapped, DirectMARLEnv):
+            env = multi_agent_to_single_agent(env)
 
-    # wrap for video recording
-    if args_cli.video:
-        video_kwargs = {
-            "video_folder": os.path.join(log_root_path, log_dir, "videos", "train"),
-            "step_trigger": lambda step: step % args_cli.video_interval == 0,
-            "video_length": args_cli.video_length,
-            "disable_logger": True,
-        }
-        print("[INFO] Recording videos during training.")
-        print_dict(video_kwargs, nesting=4)
-        env = gym.wrappers.RecordVideo(env, **video_kwargs)
-
-    # wrap around environment for rl-games
-    env = RlGamesVecEnvWrapper(env, rl_device, clip_obs, clip_actions)
-
-    # register the environment to rl-games registry
-    # note: in agents configuration: environment name must be "rlgpu"
-    vecenv.register(
-        "IsaacRlgWrapper",
-        lambda config_name, num_actors, **kwargs: RlGamesGpuEnv(config_name, num_actors, **kwargs),
-    )
-    env_configurations.register("rlgpu", {"vecenv_type": "IsaacRlgWrapper", "env_creator": lambda **kwargs: env})
-
-    # set number of actors into agent config
-    agent_cfg["params"]["config"]["num_actors"] = env.unwrapped.num_envs
-    # create runner from rl-games
-
-    if "pbt" in agent_cfg and agent_cfg["pbt"]["enabled"]:
-        # PBT is optional and its observer is unavailable in Isaac Lab 2.2.1.
-        try:
-            from isaaclab_rl.rl_games import PbtAlgoObserver
-        except ImportError as exc:
-            raise RuntimeError(
-                "PBT is enabled, but the installed Isaac Lab does not provide PbtAlgoObserver. "
-                "Disable PBT or use an Isaac Lab installation with PBT support."
-            ) from exc
-        runner = Runner(PbtAlgoObserver(agent_cfg, args_cli))
-    else:
-        runner = Runner()
-
-    runner.load(agent_cfg)
-
-    # reset the agent and env
-    runner.reset()
-    # train the agent
-
-    global_rank = int(os.getenv("RANK", "0"))
-    if args_cli.track and global_rank == 0:
-        if args_cli.wandb_entity is None:
-            raise ValueError("Weights and Biases entity must be specified for tracking.")
-        import wandb
-
-        wandb.init(
-            project=wandb_project,
-            entity=args_cli.wandb_entity,
-            name=experiment_name,
-            sync_tensorboard=True,
-            monitor_gym=True,
-            save_code=True,
-        )
-        if not wandb.run.resumed:
-            wandb.config.update({"env_cfg": env_cfg.to_dict()})
-            wandb.config.update({"agent_cfg": agent_cfg})
-
-    if args_cli.checkpoint is not None:
-        runner.run(
-            {
-                "train": True,
-                "play": False,
-                "sigma": train_sigma,
-                "checkpoint": resume_path,
+        # wrap for video recording
+        if args_cli.video:
+            video_kwargs = {
+                "video_folder": video_folder,
+                "step_trigger": lambda step: step % args_cli.video_interval == 0,
+                "video_length": args_cli.video_length,
+                "disable_logger": True,
             }
-        )
-    else:
-        runner.run({"train": True, "play": False, "sigma": train_sigma})
+            print("[INFO] Recording videos during training.")
+            print_dict(video_kwargs, nesting=4)
+            env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
-    # close the simulator
-    env.close()
+        # wrap around environment for rl-games
+        env = RlGamesVecEnvWrapper(env, rl_device, clip_obs, clip_actions)
+
+        # register the environment to rl-games registry
+        # note: in agents configuration: environment name must be "rlgpu"
+        vecenv.register(
+            "IsaacRlgWrapper",
+            lambda config_name, num_actors, **kwargs: RlGamesGpuEnv(config_name, num_actors, **kwargs),
+        )
+        env_configurations.register("rlgpu", {"vecenv_type": "IsaacRlgWrapper", "env_creator": lambda **kwargs: env})
+
+        # set number of actors into agent config
+        agent_cfg["params"]["config"]["num_actors"] = env.unwrapped.num_envs
+        # create runner from rl-games
+
+        if "pbt" in agent_cfg and agent_cfg["pbt"]["enabled"]:
+            # PBT is optional and its observer is unavailable in Isaac Lab 2.2.1.
+            try:
+                from isaaclab_rl.rl_games import PbtAlgoObserver
+            except ImportError as exc:
+                raise RuntimeError(
+                    "PBT is enabled, but the installed Isaac Lab does not provide PbtAlgoObserver. "
+                    "Disable PBT or use an Isaac Lab installation with PBT support."
+                ) from exc
+            runner = Runner(PbtAlgoObserver(agent_cfg, args_cli))
+        else:
+            runner = Runner()
+
+        runner.load(agent_cfg)
+
+        # reset the agent and env
+        runner.reset()
+        # train the agent
+
+        global_rank = int(os.getenv("RANK", "0"))
+        if args_cli.track and global_rank == 0:
+            if args_cli.wandb_entity is None:
+                raise ValueError("Weights and Biases entity must be specified for tracking.")
+            import wandb
+
+            wandb_run = wandb.init(
+                project=wandb_project,
+                entity=args_cli.wandb_entity,
+                name=experiment_name,
+                sync_tensorboard=True,
+                monitor_gym=False,
+                save_code=True,
+            )
+            if not wandb_run.resumed:
+                wandb_run.config.update({"env_cfg": env_cfg.to_dict()})
+                wandb_run.config.update({"agent_cfg": agent_cfg})
+
+        if args_cli.checkpoint is not None:
+            runner.run(
+                {
+                    "train": True,
+                    "play": False,
+                    "sigma": train_sigma,
+                    "checkpoint": resume_path,
+                }
+            )
+        else:
+            runner.run({"train": True, "play": False, "sigma": train_sigma})
 
 
 if __name__ == "__main__":
-    # run the main function
-    main()
-    # close sim app
-    simulation_app.close()
+    try:
+        main()
+    finally:
+        close_preserving_error(simulation_app.close, "Isaac Sim")
