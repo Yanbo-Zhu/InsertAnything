@@ -932,17 +932,23 @@ class InsertAnythingEnv(DirectRLEnv):
             if torch.any(self.reset_buf):
                 self.eval_ep_count += 1
 
-                num_successes = torch.sum(self.ep_succeeded)
+                num_successes = int(torch.sum(self.ep_succeeded).item())
                 success_rate = (num_successes / self.num_envs) * 100
+                successful_times_steps = self.ep_success_times[self.ep_succeeded.bool()]
+                success_time_sum_s = successful_times_steps.float().sum().item() * self.step_dt
+                self.extras["eval_metrics"] = {
+                    "success_count": num_successes,
+                    "episode_count": self.num_envs,
+                    "success_time_sum_s": success_time_sum_s,
+                }
 
                 print_str = f"\n--- Episode {self.eval_ep_count} Finished ---\n"
                 print_str += (
-                    f"    Success Rate (insert_success): {success_rate:.2f}% ({num_successes.item()}/{self.num_envs})\n"
+                    f"    Success Rate (insert_success): {success_rate:.2f}% ({num_successes}/{self.num_envs})\n"
                 )
 
                 if num_successes > 0:
-                    successful_times_steps = self.ep_success_times[self.ep_succeeded.bool()]
-                    avg_success_time_sec = torch.mean(successful_times_steps.float()) * self.step_dt
+                    avg_success_time_sec = success_time_sum_s / num_successes
                     print_str += f"    Average Success Time: {avg_success_time_sec:.2f} seconds\n"
 
                 self.extras["eval_printout"] = print_str

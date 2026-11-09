@@ -6,7 +6,9 @@
 """Evaluate an RL-Games checkpoint in an InsertAnything environment."""
 
 import argparse
+import signal
 import sys
+from distutils.util import strtobool
 
 from isaaclab.app import AppLauncher
 
@@ -35,6 +37,19 @@ parser.add_argument(
 )
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment.")
+parser.add_argument("--log_dir", type=str, default=None, help="Root directory for evaluation logs.")
+parser.add_argument(
+    "--track",
+    type=lambda value: bool(strtobool(value)),
+    nargs="?",
+    const=True,
+    default=False,
+    help="Record evaluation metrics with Weights & Biases as well as TensorBoard.",
+)
+parser.add_argument("--wandb-entity", type=str, default=None, help="Weights & Biases entity or team.")
+parser.add_argument("--wandb-project-name", type=str, default="Isaac-InsertAnything", help="Weights & Biases project.")
+parser.add_argument("--wandb-name", type=str, default=None, help="Evaluation run name.")
+parser.add_argument("--wandb-mode", choices=("online", "offline"), default=None, help="Override W&B environment mode.")
 parser.add_argument(
     "--use_last_checkpoint",
     action="store_true",
@@ -92,7 +107,16 @@ from rl_games.common import env_configurations, vecenv
 from rl_games.common.player import BasePlayer
 from rl_games.torch_runner import Runner
 
+from play_logging import EvaluationMetrics, PlayLogger
+
 _REGISTERED_TASK_MODULES = (isaaclab_tasks, insertanything_tasks)
+_stop_requested = False
+
+
+def _request_stop(_signum, _frame):
+    # A KeyboardInterrupt raised inside a native physics callback can be swallowed by Kit.
+    global _stop_requested
+    _stop_requested = True
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -141,113 +165,157 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     clip_obs = agent_cfg["params"]["env"].get("clip_observations", math.inf)
     clip_actions = agent_cfg["params"]["env"].get("clip_actions", math.inf)
 
-    # create isaac environment
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
-
-    # convert to single-agent instance if required by the RL algorithm
-    if isinstance(env.unwrapped, DirectMARLEnv):
-        env = multi_agent_to_single_agent(env)
-
-    # wrap for video recording
-    if args_cli.video:
-        video_run_dir = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        video_folder = os.path.join(log_dir, "videos", "play", video_run_dir)
-        video_kwargs = {
-            "video_folder": video_folder,
-            "step_trigger": lambda step: step == 0,
-            "video_length": args_cli.video_length,
-            "disable_logger": True,
-        }
-        print(f"[INFO] Recording video to: {video_folder}")
-        print_dict(video_kwargs, nesting=4)
-        env = gym.wrappers.RecordVideo(env, **video_kwargs)
-
-    # wrap around environment for rl-games
-    env = RlGamesVecEnvWrapper(env, rl_device, clip_obs, clip_actions)
-
-    # register the environment to rl-games registry
-    # note: in agents configuration: environment name must be "rlgpu"
-    vecenv.register(
-        "IsaacRlgWrapper",
-        lambda config_name, num_actors, **kwargs: RlGamesGpuEnv(config_name, num_actors, **kwargs),
-    )
-    env_configurations.register("rlgpu", {"vecenv_type": "IsaacRlgWrapper", "env_creator": lambda **kwargs: env})
-
-    # load previously trained model
     agent_cfg["params"]["load_checkpoint"] = True
     agent_cfg["params"]["load_path"] = resume_path
-    print(f"[INFO]: Loading model checkpoint from: {agent_cfg['params']['load_path']}")
+    agent_cfg["params"]["config"]["num_actors"] = env_cfg.scene.num_envs
+    run_name = args_cli.wandb_name or agent_cfg["params"]["config"].get("full_experiment_name") or args_cli.task
+    evaluation_logger = PlayLogger(
+        args_cli.log_dir or os.path.join(log_root_path, "play"),
+        run_name,
+        {
+            "task": args_cli.task,
+            "checkpoint": resume_path,
+            "seed": env_cfg.seed,
+            "num_envs": env_cfg.scene.num_envs,
+            "max_episodes": args_cli.max_episodes,
+            "video": args_cli.video,
+            "video_length": args_cli.video_length,
+            "env_cfg": env_cfg.to_dict(),
+            "agent_cfg": agent_cfg,
+        },
+        track=args_cli.track,
+        entity=args_cli.wandb_entity,
+        project=args_cli.wandb_project_name,
+        mode=args_cli.wandb_mode,
+    )
+    env = None
+    exit_code = 0
+    try:
+        if _stop_requested:
+            print("[INFO] Evaluation interrupted by user.")
+            return
+        # create isaac environment
+        env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
-    # set number of actors into agent config
-    agent_cfg["params"]["config"]["num_actors"] = env.unwrapped.num_envs
-    # create runner from rl-games
-    runner = Runner()
-    runner.load(agent_cfg)
-    # obtain the agent from the runner
-    agent: BasePlayer = runner.create_player()
-    agent.restore(resume_path)
-    agent.reset()
+        # convert to single-agent instance if required by the RL algorithm
+        if isinstance(env.unwrapped, DirectMARLEnv):
+            env = multi_agent_to_single_agent(env)
 
-    dt = env.unwrapped.step_dt
-
-    # reset environment. Discard the first reset to avoid transient simulator/cache state
-    # from freshly spawned assets or sensors affecting the first evaluation episode.
-    _ = env.reset()
-    obs = env.reset()
-    if isinstance(obs, dict):
-        obs = obs["obs"]
-    timestep = 0
-    completed_episodes = 0
-    # required: enables the flag for batched observations
-    _ = agent.get_batch_size(obs, 1)
-    # initialize RNN states if used
-    if agent.is_rnn:
-        agent.init_rnn()
-    # simulate environment
-    # note: We simplified the logic in rl-games player.py (:func:`BasePlayer.run()`) function in an
-    #   attempt to have complete control over environment stepping. However, this removes other
-    #   operations such as masking that is used for multi-agent learning by RL-Games.
-    while simulation_app.is_running():
-        start_time = time.time()
-        # run everything in inference mode
-        with torch.inference_mode():
-            # convert obs to agent format
-            obs = agent.obs_to_torch(obs)
-            # agent stepping
-            actions = agent.get_action(obs, is_deterministic=agent.is_deterministic)
-            # env stepping
-            obs, _, dones, infos = env.step(actions)
-
-            if isinstance(infos, dict) and "eval_printout" in infos:
-                print(infos["eval_printout"], end="")
-                completed_episodes += 1
-
-            # perform operations for terminated episodes
-            if len(dones) > 0:
-                # reset rnn state for terminated episodes
-                if agent.is_rnn and agent.states is not None:
-                    for s in agent.states:
-                        s[:, dones, :] = 0.0
+        # wrap for video recording
         if args_cli.video:
-            timestep += 1
-            # exit the play loop after recording one video
-            if timestep == args_cli.video_length:
+            video_run_dir = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            video_folder = os.path.join(log_dir, "videos", "play", video_run_dir)
+            video_kwargs = {
+                "video_folder": video_folder,
+                "step_trigger": lambda step: step == 0,
+                "video_length": args_cli.video_length,
+                "disable_logger": True,
+            }
+            print(f"[INFO] Recording video to: {video_folder}")
+            print_dict(video_kwargs, nesting=4)
+            env = gym.wrappers.RecordVideo(env, **video_kwargs)
+
+        # wrap around environment for rl-games
+        env = RlGamesVecEnvWrapper(env, rl_device, clip_obs, clip_actions)
+
+        # register the environment to rl-games registry
+        # note: in agents configuration: environment name must be "rlgpu"
+        vecenv.register(
+            "IsaacRlgWrapper",
+            lambda config_name, num_actors, **kwargs: RlGamesGpuEnv(config_name, num_actors, **kwargs),
+        )
+        env_configurations.register("rlgpu", {"vecenv_type": "IsaacRlgWrapper", "env_creator": lambda **kwargs: env})
+
+        # load previously trained model
+        print(f"[INFO]: Loading model checkpoint from: {agent_cfg['params']['load_path']}")
+
+        # set number of actors into agent config
+        agent_cfg["params"]["config"]["num_actors"] = env.unwrapped.num_envs
+        # create runner from rl-games
+        runner = Runner()
+        runner.load(agent_cfg)
+        # obtain the agent from the runner
+        agent: BasePlayer = runner.create_player()
+        agent.restore(resume_path)
+        agent.reset()
+
+        dt = env.unwrapped.step_dt
+
+        # reset environment. Discard the first reset to avoid transient simulator/cache state
+        # from freshly spawned assets or sensors affecting the first evaluation episode.
+        _ = env.reset()
+        obs = env.reset()
+        if isinstance(obs, dict):
+            obs = obs["obs"]
+        timestep = 0
+        completed_episodes = 0
+        evaluation_metrics = EvaluationMetrics()
+        # required: enables the flag for batched observations
+        _ = agent.get_batch_size(obs, 1)
+        # initialize RNN states if used
+        if agent.is_rnn:
+            agent.init_rnn()
+        # simulate environment
+        # note: We simplified the logic in rl-games player.py (:func:`BasePlayer.run()`) function in an
+        #   attempt to have complete control over environment stepping. However, this removes other
+        #   operations such as masking that is used for multi-agent learning by RL-Games.
+        while simulation_app.is_running() and not _stop_requested:
+            start_time = time.time()
+            # run everything in inference mode
+            with torch.inference_mode():
+                # convert obs to agent format
+                obs = agent.obs_to_torch(obs)
+                # agent stepping
+                actions = agent.get_action(obs, is_deterministic=agent.is_deterministic)
+                # env stepping
+                obs, rewards, dones, infos = env.step(actions)
+
+                metrics = evaluation_metrics.step(rewards, infos)
+                if metrics is not None:
+                    evaluation_logger.log(metrics)
+
+                if isinstance(infos, dict) and "eval_printout" in infos:
+                    print(infos["eval_printout"], end="")
+                    completed_episodes += 1
+
+                # perform operations for terminated episodes
+                if len(dones) > 0:
+                    # reset rnn state for terminated episodes
+                    if agent.is_rnn and agent.states is not None:
+                        for s in agent.states:
+                            s[:, dones, :] = 0.0
+            if args_cli.video:
+                timestep += 1
+                # exit the play loop after recording one video
+                if timestep == args_cli.video_length:
+                    break
+
+            if args_cli.max_episodes is not None and completed_episodes >= args_cli.max_episodes:
                 break
 
-        if args_cli.max_episodes is not None and completed_episodes >= args_cli.max_episodes:
-            break
-
-        # time delay for real-time evaluation
-        sleep_time = dt - (time.time() - start_time)
-        if args_cli.real_time and sleep_time > 0:
-            time.sleep(sleep_time)
-
-    # close the simulator
-    env.close()
+            # time delay for real-time evaluation
+            sleep_time = dt - (time.time() - start_time)
+            if args_cli.real_time and sleep_time > 0:
+                time.sleep(sleep_time)
+        if _stop_requested:
+            print("[INFO] Evaluation interrupted by user.")
+    except Exception:
+        exit_code = 1
+        raise
+    finally:
+        try:
+            evaluation_logger.close(exit_code=exit_code)
+        finally:
+            if env is not None:
+                env.close()
 
 
 if __name__ == "__main__":
-    # run the main function
-    main()
-    # close sim app
-    simulation_app.close()
+    # Flush logs before Kit's default Ctrl+C handler unloads simulator plugins.
+    signal.signal(signal.SIGINT, _request_stop)
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("[INFO] Evaluation interrupted by user.")
+    finally:
+        simulation_app.close()

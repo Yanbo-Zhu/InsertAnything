@@ -95,6 +95,64 @@ python scripts/rl_games/play.py \
   --checkpoint source/InsertAnything/InsertAnything/tasks/direct/insertanything/checkpoints/InsertAnything-LHole-III-Direct-v0.pth
 ```
 
+Evaluation writes TensorBoard events automatically. Each run has a unique directory under
+`logs/rl_games/InsertAnything/play/<name>-<timestamp>/tensorboard/`. Override the root with `--log_dir`.
+The absolute run directory and TensorBoard command are printed at startup.
+
+```bash
+python scripts/rl_games/play.py \
+  --task InsertAnything-LHole-III-Direct-v0 \
+  --num_envs 8 --max_episodes 50 --seed 0 --headless \
+  --log_dir logs/rl_games/InsertAnything/play \
+  --checkpoint source/InsertAnything/InsertAnything/tasks/direct/insertanything/checkpoints/InsertAnything-LHole-III-Direct-v0.pth
+
+tensorboard --logdir logs/rl_games/InsertAnything/play --port 6006
+```
+
+Open `http://localhost:6006`. Metrics use the completed parallel evaluation round as their horizontal axis.
+They include per-round and cumulative success rates (percent), success counts, mean return, and mean first-success
+time (seconds). Cumulative success time is weighted by successful episodes. A zero-success round omits its mean
+success time. `reward_terms_raw/*` contains time averages of the existing unscaled reward terms, not their weighted
+contributions to return. `progress/*` records rounds, control steps and cumulative individual environment episodes.
+For synchronized tasks, 8 environments and 50 rounds correspond to 400 individual environment episodes.
+
+To also record the same metrics in an online W&B run:
+
+```bash
+python scripts/rl_games/play.py \
+  --task InsertAnything-LHole-III-Direct-v0 \
+  --num_envs 8 --max_episodes 50 --seed 0 --headless \
+  --checkpoint source/InsertAnything/InsertAnything/tasks/direct/insertanything/checkpoints/InsertAnything-LHole-III-Direct-v0.pth \
+  --track --wandb-entity dylan1000-bht \
+  --wandb-project-name Isaac-InsertAnything \
+  --wandb-name play-LHole-III --wandb-mode online
+```
+
+To record W&B data offline without uploading:
+
+```bash
+python scripts/rl_games/play.py \
+  --task InsertAnything-LHole-III-Direct-v0 \
+  --num_envs 8 --max_episodes 50 --seed 0 --headless \
+  --checkpoint source/InsertAnything/InsertAnything/tasks/direct/insertanything/checkpoints/InsertAnything-LHole-III-Direct-v0.pth \
+  --track --wandb-project-name Isaac-InsertAnything \
+  --wandb-name play-LHole-III-offline --wandb-mode offline
+```
+
+W&B is optional and is not initialized without `--track`. The project defaults to `Isaac-InsertAnything`; entity
+uses the supplied argument or the SDK's account configuration. Run names use `--wandb-name`, then the agent's
+`full_experiment_name`, then the task name. `--wandb-mode offline` saves W&B data locally without uploading;
+if the mode is omitted, the SDK follows `WANDB_MODE` and its own defaults. W&B local files share the evaluation
+run directory. Online runs print their URL; offline runs explicitly print the local path. Requested W&B logging
+failures stop evaluation rather than silently falling back. TensorBoard is written directly and is not automatically
+synced to W&B a second time. Completed rounds are flushed immediately; normal exit and Ctrl+C close the recorders
+before shutting down the simulator.
+
+Video behavior is unchanged: `--video` still ends playback at `--video_length` (default 200 steps).
+If playback ends before the first completed evaluation round, the event file contains configuration but no round
+curves. Use evaluation without video when collecting full multi-round statistics. Terminal output saved by `tee`
+is a separate text log, not a TensorBoard event file. No training losses are produced during evaluation.
+
 Registered simulation tasks:
 
 | Gym ID | Description |
