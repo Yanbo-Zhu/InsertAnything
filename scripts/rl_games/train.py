@@ -100,7 +100,7 @@ from isaaclab.envs import (
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 from isaaclab.utils.io import dump_pickle, dump_yaml
-from isaaclab_rl.rl_games import PbtAlgoObserver, RlGamesGpuEnv, RlGamesVecEnvWrapper
+from isaaclab_rl.rl_games import RlGamesGpuEnv, RlGamesVecEnvWrapper
 from isaaclab_tasks.utils.hydra import hydra_task_config
 from rl_games.common import env_configurations, vecenv
 from rl_games.torch_runner import Runner
@@ -219,6 +219,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # create runner from rl-games
 
     if "pbt" in agent_cfg and agent_cfg["pbt"]["enabled"]:
+        # PBT is optional and its observer is unavailable in Isaac Lab 2.2.1.
+        try:
+            from isaaclab_rl.rl_games import PbtAlgoObserver
+        except ImportError as exc:
+            raise RuntimeError(
+                "PBT is enabled, but the installed Isaac Lab does not provide PbtAlgoObserver. "
+                "Disable PBT or use an Isaac Lab installation with PBT support."
+            ) from exc
         runner = Runner(PbtAlgoObserver(agent_cfg, args_cli))
     else:
         runner = Runner()
