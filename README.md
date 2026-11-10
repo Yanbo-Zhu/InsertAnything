@@ -85,6 +85,20 @@ Example training command:
 python scripts/rl_games/train.py --task InsertAnything-CircleHole-I-Direct-v0 --num_envs 128 --headless
 ```
 
+Training retains the existing RL-Games loss, return, episode-length, performance, and optimizer metrics.
+It also writes `train/success_rate_percent`, cumulative success statistics, `train/mean_return`, and first-success
+times in seconds to the same TensorBoard log. With `--track`, the existing TensorBoard integration syncs both
+sets of metrics to W&B. `reward_terms_raw/*` and `progress/*` retain the names used during playback; the
+training epoch is recorded as `train/epoch`.
+
+New episode statistics summarize episodes completed during each training epoch, including their terminal rewards.
+An episode counts as successful if it ever satisfies the same insertion criterion used by playback. Episodes spanning
+epochs are counted when they finish. Success rates and mean returns appear after the first completed episode;
+success-time means appear only after successful episodes. Cumulative statistics start with the current training process.
+Raw reward terms are averaged over the epoch's sampled steps. Playback summarizes evaluation rounds, so use the
+completed episode counts and cumulative curves when comparing it with training. In distributed training, these
+additional metrics describe the main process's environments, following the existing writer ownership.
+
 Example evaluation command:
 
 ```bash

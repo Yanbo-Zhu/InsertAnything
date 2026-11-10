@@ -727,7 +727,8 @@ class InsertAnythingEnv(DirectRLEnv):
         return torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
 
     def _log_episode_metrics(self, rew_dict, curr_successes):
-        if torch.any(self.reset_buf):
+        has_finished_episodes = torch.any(self.reset_buf)
+        if has_finished_episodes:
             self.extras["successes"] = torch.count_nonzero(curr_successes) / self.num_envs
 
         first_success = torch.logical_and(curr_successes, torch.logical_not(self.ep_succeeded))
@@ -743,6 +744,15 @@ class InsertAnythingEnv(DirectRLEnv):
 
         for rew_name, rew in rew_dict.items():
             self.extras[f"logs_rew_{rew_name}"] = rew.mean()
+
+        if not self.cfg.evaluation_mode and has_finished_episodes:
+            # Snapshot before auto-reset; count only environments ending on this step.
+            succeeded = self.reset_buf & self.ep_succeeded.bool()
+            self.extras["train_episode_metrics"] = {
+                "success_count": int(succeeded.sum().item()),
+                "episode_count": int(self.reset_buf.sum().item()),
+                "success_time_sum_s": self.ep_success_times[succeeded].float().sum().item() * self.step_dt,
+            }
 
     def _get_reward_terms(self):
         rew_dict, rew_scales = {}, {}
@@ -914,6 +924,7 @@ class InsertAnythingEnv(DirectRLEnv):
         return rew_dict, rew_scales, curr_successes
 
     def _get_rewards(self):
+        self.extras.pop("train_episode_metrics", None)
         if self.cfg.evaluation_mode:
             self.extras.clear()
         rew_dict, rew_scales, curr_successes_for_training_log = self._get_reward_terms()

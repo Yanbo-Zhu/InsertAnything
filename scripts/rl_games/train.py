@@ -10,6 +10,7 @@ import sys
 from distutils.util import strtobool
 
 from train_logging import (
+    TrainingMetricsObserver,
     cleanup_on_exit,
     close_preserving_error,
     close_training_writer,
@@ -254,6 +255,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         else:
             runner = Runner()
 
+        runner.algo_observer = TrainingMetricsObserver(runner.algo_observer)
         runner.load(agent_cfg)
 
         # reset the agent and env
