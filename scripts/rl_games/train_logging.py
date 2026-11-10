@@ -1,8 +1,7 @@
-"""Training metrics, video upload and cleanup helpers, independent of the simulator."""
+"""Training metrics, W&B axes and cleanup helpers, independent of the simulator."""
 
 import sys
 from contextlib import contextmanager
-from pathlib import Path
 
 
 class TrainingMetrics:
@@ -140,19 +139,11 @@ def close_training_writer(runner):
         writer.close()
 
 
-def video_file_states(folder):
-    """Identify new or overwritten MP4 files when a run directory is reused."""
-    if folder is None:
-        return {}
-    return {path: (path.stat().st_mtime_ns, path.stat().st_size) for path in Path(folder).glob("*.mp4")}
-
-
-def upload_training_videos(run, folder, previous_states):
-    """Upload finalized recordings explicitly, without W&B's Gym monkey patch."""
-    if run is None or folder is None:
-        return
-    import wandb
-
-    for path, state in sorted(video_file_states(folder).items()):
-        if state != previous_states.get(path):
-            run.log({f"videos/train/{path.stem}": wandb.Video(str(path), format="mp4")})
+def configure_wandb_axes(run):
+    """Set training chart axes without replacing W&B's internal history counter."""
+    for pattern in ("train/*", "reward_terms_raw/*", "performance/*"):
+        run.define_metric(pattern, step_metric="info/epochs", step_sync=False)
+    for pattern in ("loss/*", "losses/*", "info/*"):
+        run.define_metric(pattern, step_metric="global_step", step_sync=False)
+    # W&B also registers referenced axes as metrics; make this axis's own chart rule explicit.
+    run.define_metric("info/epochs", step_metric="global_step", step_sync=False)

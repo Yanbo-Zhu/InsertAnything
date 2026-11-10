@@ -9,7 +9,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import gymnasium as gym
 import numpy as np
@@ -18,7 +18,6 @@ from tensorboardX import SummaryWriter
 
 SCRIPT_DIR = Path(__file__).resolve().parents[1] / "scripts" / "rl_games"
 sys.path.insert(0, str(SCRIPT_DIR))
-from train_logging import upload_training_videos, video_file_states
 
 
 class TrainingShutdownTests(unittest.TestCase):
@@ -94,6 +93,8 @@ class TrainingShutdownTests(unittest.TestCase):
             return lambda func: lambda: func(env_cfg, agent_cfg)
 
         def train(args):
+            if track and rank == 0:
+                self.assertEqual(run.define_metric.call_count, 7)
             events.append("train")
             state.writer = SummaryWriter("summaries")
             state.writer.add_scalar("test/loss", 0.5, 512)
@@ -117,24 +118,19 @@ class TrainingShutdownTests(unittest.TestCase):
             if failure in ("finish", "train_and_finish"):
                 raise RuntimeError("W&B finish failed")
 
-        def log_video(values):
-            # The recording must already have been finalized by env.close().
-            self.assertIn("env.close", events)
-            for value in values.values():
-                self.assertGreater(Path(value.path).stat().st_size, 0)
-            events.append("video.log")
-            if failure == "upload":
-                raise RuntimeError("video upload failed")
-
         run = SimpleNamespace(
-            resumed=False, config=Mock(), log=Mock(side_effect=log_video), finish=Mock(side_effect=finish)
+            resumed=False, config=Mock(), define_metric=Mock(),
+            log=Mock(side_effect=AssertionError("Training must sync scalars only through TensorBoard")),
+            finish=Mock(side_effect=finish),
         )
         wandb = module(
             "wandb", init=Mock(return_value=run),
-            Video=Mock(side_effect=lambda path, **kwargs: SimpleNamespace(path=path)),
+            Video=Mock(side_effect=AssertionError("Training videos must remain local")),
         )
         if failure == "init":
             wandb.init.side_effect = RuntimeError("W&B init failed")
+        if failure == "axes":
+            run.define_metric.side_effect = RuntimeError("W&B axis configuration failed")
         if not track or rank != 0:
             modules["wandb"] = None  # Any accidental W&B import fails in these modes.
         runner = Mock()
@@ -197,32 +193,46 @@ class TrainingShutdownTests(unittest.TestCase):
             close_error=close_error, wandb=wandb, run=run, clip_sizes=clip_sizes,
         )
 
-    def test_video_is_finalized_and_uploaded_before_successful_shutdown(self):
+    def test_video_is_finalized_locally_without_upload_before_successful_shutdown(self):
         result = self.execute(video=True)
         self.assertIsNone(result.error)
         self.assertEqual(
-            result.events, ["train", "env.close", "writer.close", "video.log", "wandb.finish:0", "app.close"]
+            result.events, ["train", "env.close", "writer.close", "wandb.finish:0", "app.close"]
         )
         self.assertTrue(result.clip_sizes)
         self.assertFalse(result.wandb.init.call_args.kwargs["monitor_gym"])
         self.assertTrue(result.wandb.init.call_args.kwargs["sync_tensorboard"])
+        result.wandb.Video.assert_not_called()
+        result.run.log.assert_not_called()
+        self.assertEqual(result.run.define_metric.call_args_list, [
+            call(pattern, step_metric=axis, step_sync=False)
+            for pattern, axis in (
+                ("train/*", "info/epochs"), ("reward_terms_raw/*", "info/epochs"),
+                ("performance/*", "info/epochs"), ("loss/*", "global_step"),
+                ("losses/*", "global_step"), ("info/*", "global_step"),
+                ("info/epochs", "global_step"),
+            )
+        ])
 
     def test_training_error_still_finalizes_partial_video_and_marks_run_failed(self):
         result = self.execute(video=True, failure="train")
         self.assertIs(result.error, result.training_error)
         self.assertEqual(
-            result.events[-5:], ["env.close", "writer.close", "video.log", "wandb.finish:1", "app.close"]
+            result.events[-4:], ["env.close", "writer.close", "wandb.finish:1", "app.close"]
         )
+        self.assertTrue(result.clip_sizes)
+        result.wandb.Video.assert_not_called()
+        result.run.log.assert_not_called()
 
     def test_environment_close_error_still_finishes_wandb_and_closes_app(self):
         result = self.execute(failure="close")
         self.assertIs(result.error, result.close_error)
         self.assertEqual(result.events[-2:], ["wandb.finish:1", "app.close"])
 
-    def test_upload_error_still_finishes_wandb_and_closes_app(self):
-        result = self.execute(video=True, failure="upload")
-        self.assertEqual(str(result.error), "video upload failed")
-        self.assertEqual(result.events[-2:], ["wandb.finish:1", "app.close"])
+    def test_axis_configuration_error_still_finishes_wandb_and_closes_app(self):
+        result = self.execute(failure="axes")
+        self.assertEqual(str(result.error), "W&B axis configuration failed")
+        self.assertEqual(result.events, ["env.close", "wandb.finish:1", "app.close"])
 
     def test_writer_close_error_still_finishes_wandb_and_closes_app(self):
         result = self.execute(failure="writer")
@@ -261,25 +271,6 @@ class TrainingShutdownTests(unittest.TestCase):
         result = self.execute(rank=1)
         self.assertIsNone(result.error)
         self.assertEqual(result.events, ["train", "env.close", "writer.close", "app.close"])
-
-
-class VideoSelectionTests(unittest.TestCase):
-    def test_reused_directory_uploads_only_new_and_overwritten_clips(self):
-        run = Mock()
-        wandb = SimpleNamespace(Video=Mock(side_effect=lambda path, **kwargs: path))
-        with tempfile.TemporaryDirectory() as folder:
-            old = Path(folder) / "old.mp4"
-            overwritten = Path(folder) / "overwritten.mp4"
-            old.write_bytes(b"old")
-            overwritten.write_bytes(b"old")
-            previous = video_file_states(folder)
-            overwritten.write_bytes(b"new content")
-            new = Path(folder) / "new.mp4"
-            new.write_bytes(b"new")
-            with patch.dict(sys.modules, {"wandb": wandb}):
-                upload_training_videos(run, folder, previous)
-            self.assertEqual([call.args[0] for call in wandb.Video.call_args_list], [str(new), str(overwritten)])
-            self.assertEqual(run.log.call_count, 2)
 
 
 if __name__ == "__main__":

@@ -91,6 +91,11 @@ times in seconds to the same TensorBoard log. With `--track`, the existing Tenso
 sets of metrics to W&B. `reward_terms_raw/*` and `progress/*` retain the names used during playback; the
 training epoch is recorded as `train/epoch`.
 
+Training W&B charts use `info/epochs` for `train/*`, `reward_terms_raw/*`, and `performance/*`, and
+`global_step` for `loss/*`, `losses/*`, and `info/*`. These defaults leave W&B's internal `Step` / `_step`
+counter and TensorBoard event steps unchanged. Other metric groups retain their existing axis settings.
+Training videos recorded with `--video` are saved locally and are not uploaded to W&B.
+
 New episode statistics summarize episodes completed during each training epoch, including their terminal rewards.
 An episode counts as successful if it ever satisfies the same insertion criterion used by playback. Episodes spanning
 epochs are counted when they finish. Success rates and mean returns appear after the first completed episode;

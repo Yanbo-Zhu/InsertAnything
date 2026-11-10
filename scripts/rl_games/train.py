@@ -14,8 +14,7 @@ from train_logging import (
     cleanup_on_exit,
     close_preserving_error,
     close_training_writer,
-    upload_training_videos,
-    video_file_states,
+    configure_wandb_axes,
 )
 
 from isaaclab.app import AppLauncher
@@ -197,14 +196,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     runner = None
     wandb_run = None
     video_folder = os.path.join(log_root_path, log_dir, "videos", "train") if args_cli.video else None
-    previous_videos = video_file_states(video_folder)
-    # Unwind in reverse order: finalize recordings and metrics, upload videos, finish W&B.
+    # Unwind in reverse order: finalize local recordings and metrics, finish W&B.
     with (
         cleanup_on_exit(
             lambda: wandb_run.finish(exit_code=int(sys.exception() is not None)) if wandb_run is not None else None,
             "W&B run",
         ),
-        cleanup_on_exit(lambda: upload_training_videos(wandb_run, video_folder, previous_videos), "video upload"),
         cleanup_on_exit(lambda: close_training_writer(runner), "TensorBoard writer"),
         cleanup_on_exit(lambda: env.close() if env is not None else None, "training environment"),
     ):
@@ -276,6 +273,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 monitor_gym=False,
                 save_code=True,
             )
+            configure_wandb_axes(wandb_run)
             if not wandb_run.resumed:
                 wandb_run.config.update({"env_cfg": env_cfg.to_dict()})
                 wandb_run.config.update({"agent_cfg": agent_cfg})
